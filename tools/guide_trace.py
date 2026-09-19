@@ -138,6 +138,8 @@ class GuideTraceCollector:
         self.tool_ms = 0.0
         self.tool_calls = 0
         self.dropped_tool_calls = 0
+        self.memory_enabled = False
+        self.memory_context_entries = 0
 
     def begin_round(self, phase):
         if len(self.rounds) >= MAX_ROUNDS:
@@ -147,6 +149,11 @@ class GuideTraceCollector:
             'phase': 'routing' if phase == 'routing' else 'answer',
             'tools': [],
         })
+
+    def record_memory(self, enabled, context_entries):
+        """Count of prior Q/A turns replayed; never their text."""
+        self.memory_enabled = bool(enabled)
+        self.memory_context_entries = max(0, int(context_entries))
 
     def record_provider(self, duration_ms):
         self.provider_calls += 1
@@ -184,10 +191,12 @@ class GuideTraceCollector:
         if error_code is not None and error_code not in ERROR_CODES:
             error_code = 'internal-error'
         total = max(0.0, (self._clock() - self._started) * 1000.0)
+        rounds = [dict(item, index=position) for position, item in enumerate(
+            (item for item in self.rounds if item['tools']), start=1)]
         return {
             'schema_version': TRACE_SCHEMA_VERSION,
             'grounding_state': grounding_state,
-            'rounds': [item for item in self.rounds if item['tools']],
+            'rounds': rounds,
             'provider_ms': round(self.provider_ms),
             'provider_calls': self.provider_calls,
             'tool_ms': round(self.tool_ms),
@@ -196,6 +205,8 @@ class GuideTraceCollector:
             'evidence_markers': int(evidence_markers),
             'tool_failures': self.tool_failures(),
             'dropped_tool_calls': self.dropped_tool_calls,
+            'memory': {'enabled': self.memory_enabled,
+                       'context_entries': self.memory_context_entries},
             'error_code': error_code,
         }
 

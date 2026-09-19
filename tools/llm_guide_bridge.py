@@ -1569,6 +1569,7 @@ class LLMBridge:
 
             # Call LLM with enriched prompt + conversation history
             recent = memories.get('recent', [])
+            self.trace.record_memory(self.memory_enabled, len(recent))
             lookup_context, clarification, routing_tokens = self.route_question(
                 question, char_context or '', recent)
             if clarification:

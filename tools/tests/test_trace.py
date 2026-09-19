@@ -162,6 +162,21 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(trace['dropped_tool_calls'], 5)
         self.assertEqual(trace['tool_calls'], MAX_TOOL_CALLS + 5)
 
+    def test_empty_rounds_are_dropped_and_renumbered(self):
+        collector = GuideTraceCollector(GAME_TOOLS)
+        collector.begin_round('routing')
+        collector.begin_round('answer')
+        collector.record_tool('find_npc', {'npc_name': 'A'}, '[[npc:1:A]]', 1)
+        rounds = collector.finish('verified')['rounds']
+        self.assertEqual([(item['index'], item['phase']) for item in rounds],
+                         [(1, 'answer')])
+
+    def test_memory_is_counted_not_copied(self):
+        collector = GuideTraceCollector(GAME_TOOLS)
+        collector.record_memory(True, 3)
+        self.assertEqual(collector.finish('verified')['memory'],
+                         {'enabled': True, 'context_entries': 3})
+
     def test_unknown_states_are_normalized(self):
         trace = GuideTraceCollector(GAME_TOOLS).finish('bogus', error_code='x')
         self.assertEqual(trace['grounding_state'], 'unknown')
@@ -241,6 +256,8 @@ class ProcessRequestTraceTests(unittest.TestCase):
         self.assertEqual(tool['args']['service_type'], 'class_trainer')
         self.assertEqual(trace['provider_calls'], 2)
         self.assertEqual(trace['evidence_markers'], 1)
+        self.assertEqual(trace['memory'], {'enabled': False,
+                                           'context_entries': 0})
         self.assertEqual(params[4:7], (trace['provider_ms'], trace['tool_ms'],
                                        trace['total_ms']))
         self.assertEqual(params[-1], self.bridge.lease_token)
