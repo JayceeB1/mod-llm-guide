@@ -36,6 +36,7 @@ from guide_routing import (
 )
 from guide_followup import reverify_followup
 from guide_presentation import compact_equipment_answer
+from guide_trace import GuideTraceCollector, classify_error, trace_json
 from guide_tool_contracts import export_tools
 from guide_conversation import (
     CONTEXT_TOOL, CONTEXT_PROMPT, conversation_view, parse_context,
@@ -842,29 +843,50 @@ class LLMBridge:
         """, (self.lease_token, self.request_timeout, request_id))
         return cursor.rowcount == 1
 
-    def save_response(self, cursor, request_id, response, tokens_used=0):
-        """Save the LLM response."""
+    @staticmethod
+    def _trace_columns(trace):
+        """Queue column values for an optional structured trace."""
+        if not trace:
+            return (None, None, None, None, None)
+        return (trace_json(trace), trace.get('grounding_state'),
+                trace.get('provider_ms'), trace.get('tool_ms'),
+                trace.get('total_ms'))
+
+    def save_response(self, cursor, request_id, response, tokens_used=0,
+                      trace=None):
+        """Save the LLM response and its structured trace."""
         cursor.execute("""
             UPDATE llm_guide_queue
             SET status = 'complete',
                 response = %s,
                 tokens_used = %s,
-                processed_at = NOW()
+                processed_at = NOW(),
+                trace_json = %s,
+                grounding_state = %s,
+                provider_ms = %s,
+                tool_ms = %s,
+                total_ms = %s
             WHERE id = %s AND status = 'processing' AND lease_token = %s
               AND lease_until >= NOW()
-        """, (response, tokens_used, request_id, self.lease_token))
+        """, (response, tokens_used, *self._trace_columns(trace), request_id,
+              self.lease_token))
         return cursor.rowcount == 1
 
-    def save_error(self, cursor, request_id, error_message):
-        """Save an error for a request."""
+    def save_error(self, cursor, request_id, error_message, trace=None):
+        """Save an error for a request with a safe trace (never the message)."""
         cursor.execute("""
             UPDATE llm_guide_queue
             SET status = 'error',
                 error_message = %s,
-                processed_at = NOW()
+                processed_at = NOW(),
+                trace_json = %s,
+                grounding_state = %s,
+                provider_ms = %s,
+                tool_ms = %s,
+                total_ms = %s
             WHERE id = %s AND status = 'processing' AND lease_token = %s
         """, ("The guide could not verify an answer. Please try again.",
-              request_id, self.lease_token))
+              *self._trace_columns(trace), request_id, self.lease_token))
 
     def remaining_timeout(self):
         remaining = self.deadline - time.monotonic()
@@ -872,12 +894,36 @@ class LLMBridge:
             raise TimeoutError("Guide request deadline exceeded")
         return min(self.api_timeout, remaining)
 
+    def _trace_round(self, phase):
+        trace = getattr(self, 'trace', None)
+        if trace is not None:
+            trace.begin_round(phase)
+
+    def _trace_provider(self, started):
+        trace = getattr(self, 'trace', None)
+        if trace is not None:
+            trace.record_provider((time.monotonic() - started) * 1000.0)
+
+    def execute_traced_tool(self, tool_name, tool_input):
+        """Run one game tool through the normal executor and trace it."""
+        started = time.monotonic()
+        result = self.tool_executor.execute_tool(tool_name, tool_input)
+        trace = getattr(self, 'trace', None)
+        if trace is not None:
+            trace.record_tool(tool_name, tool_input, result,
+                              (time.monotonic() - started) * 1000.0,
+                              self.tool_executor)
+        return result
+
     def provider_call(self, operation, **kwargs):
         """Retry only transient failures, sharing the request's time budget."""
         for attempt in range(self.api_retries + 1):
+            timeout = self.remaining_timeout()
+            started = time.monotonic()
             try:
-                return operation(**dict(kwargs, timeout=self.remaining_timeout()))
+                result = operation(**dict(kwargs, timeout=timeout))
             except Exception as error:
+                self._trace_provider(started)
                 status = getattr(error, 'status_code', None)
                 transient = (status in {408, 409, 429} or
                              isinstance(status, int) and status >= 500 or
@@ -889,6 +935,9 @@ class LLMBridge:
                 if time.monotonic() + delay >= self.deadline:
                     raise TimeoutError("Guide request deadline exceeded") from error
                 time.sleep(delay)
+            else:
+                self._trace_provider(started)
+                return result
 
     def build_system_prompt(self, char_context: str, memories: dict) -> str:
         """Build the system prompt with character context and memories.
@@ -998,6 +1047,7 @@ class LLMBridge:
             # Check if we need to handle tool use
             if response.stop_reason == "tool_use":
                 tools_were_used = True  # Mark that tools were used
+                self._trace_round('answer')
                 # Extract tool use blocks
                 tool_results = []
                 assistant_content = response.content
@@ -1011,7 +1061,7 @@ class LLMBridge:
                         logger.info(f"Tool call: {tool_name}({tool_input})")
 
                         # Execute the tool
-                        result = self.tool_executor.execute_tool(tool_name, tool_input)
+                        result = self.execute_traced_tool(tool_name, tool_input)
                         logger.info(f"Tool result: {result[:200]}..." if len(result) > 200 else f"Tool result: {result}")
 
                         tool_results.append({
@@ -1224,6 +1274,7 @@ class LLMBridge:
             # Check if we need to handle tool calls
             if message.tool_calls:
                 tools_were_used = True
+                self._trace_round('answer')
 
                 # Add assistant message with tool calls to history
                 messages.append(message)
@@ -1239,7 +1290,7 @@ class LLMBridge:
                     logger.info(f"Tool call: {tool_name}({tool_input})")
 
                     # Execute the tool
-                    result = self.tool_executor.execute_tool(tool_name, tool_input)
+                    result = self.execute_traced_tool(tool_name, tool_input)
                     log_result = f"{result[:200]}..." if len(result) > 200 else result
                     logger.info(f"Tool result: {log_result}")
 
@@ -1404,9 +1455,10 @@ class LLMBridge:
                 status='clarify', question=plan[0]['tool_input']['question'])
             return '', plan[0]['tool_input']['question'], tokens
         results = []
+        self._trace_round('routing')
         for call in plan:
             self.remaining_timeout()
-            result = self.tool_executor.execute_tool(
+            result = self.execute_traced_tool(
                 call['tool_name'], call['tool_input'])
             results.append(dict(call, result=result))
         return (
@@ -1428,6 +1480,7 @@ class LLMBridge:
             return
         self.deadline = time.monotonic() + self.request_timeout
         self.conversation_context = None
+        self.trace = GuideTraceCollector(GAME_TOOLS)
 
         try:
             snapshot = decode_snapshot(snapshot_raw)
@@ -1535,7 +1588,12 @@ class LLMBridge:
                 detailed=bool(re.search(
                     r'\b(stats?|numbers?|numeric|detailed|compare|comparison|'
                     r'enchants?|gems?|procs?|scaling)\b', question, re.IGNORECASE)))
-            if not self.save_response(cursor, request_id, response, tokens):
+            trace = self.trace.finish(
+                self.grounding_state(
+                    question, bool(clarification) or reference_clarification),
+                len(self.tool_executor.evidence.markers))
+            if not self.save_response(cursor, request_id, response, tokens,
+                                      trace=trace):
                 return
 
             # Store memory with full Q&A for future message replay
@@ -1551,11 +1609,27 @@ class LLMBridge:
             logger.info(f"Request {request_id} completed ({tokens} tokens)")
         except Exception as e:
             logger.error(f"Request {request_id} failed: {e}")
-            self.save_error(cursor, request_id, str(e))
+            trace = self.trace.finish(
+                'failed', len(self.tool_executor.evidence.markers),
+                error_code=classify_error(e))
+            self.save_error(cursor, request_id, str(e), trace=trace)
         finally:
             for client in self.api_clients:
                 client.close()
             self.api_clients.clear()
+
+    def grounding_state(self, question, clarified):
+        """Final grounding of a published answer, from the same authorities
+        finalize_answer used (requires_evidence and AnswerReadiness)."""
+        if clarified:
+            return 'clarification'
+        if not requires_evidence(question):
+            return 'not-required'
+        readiness = self.tool_executor.readiness
+        if self.tool_executor.readiness_enabled and readiness.blocked():
+            failed = any('lookup failed' in note for note in readiness.notes())
+            return 'failed' if failed else 'no-result'
+        return 'verified'
 
     def validate_config(self) -> bool:
         """Validate the configuration."""

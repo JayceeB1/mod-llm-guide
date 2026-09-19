@@ -1,5 +1,27 @@
 # Changelog
 
+### 2026-09-19 - Trusted Console Ingress and Structured Trace (Azeroth Control fork)
+
+Fork of `Hokken/mod-llm-guide` at `4b89056`, kept minimal and upstreamable.
+
+* **One submission path**: `.ag`, the `AzerothGuide` whisper and the new
+  console ingress all call `SubmitGuideRequest()`, which owns validation
+  (500 bytes, 8 lines, no control characters, valid UTF-8), cooldown,
+  pending limits, the live character context/snapshot and the queue row.
+* **Console-only control**: `agctl submit` / `agctl clear` (`SEC_CONSOLE`)
+  with strict token, GUID and base64url parsing and one machine-readable
+  `AZC_GUIDE_CONTROL` line per command, never containing question text.
+* **Origin-aware queue**: rows record `origin` (`ingame` or `web`) and a
+  unique `external_request_id`; the world script delivers only in-game rows.
+* **Structured trace**: `tools/guide_trace.py` records routing and answer
+  rounds, tool status/timing/marker counts, scalar schema arguments,
+  provider timing and the final grounding state, persisted by
+  `save_response()` / `save_error()`. No results, SQL, prompts, payloads or
+  reasoning are stored; failures keep a fixed error code only.
+* **Safe migration**: an idempotent update file plus the matching bridge
+  migration. The base SQL file is unchanged so AzerothCore never re-applies
+  it and wipes `llm_guide_memory`.
+
 ### 2026-09-14 - Model Compatibility and Provider Switching
 
 * **Five provider backends**: The guide can use Anthropic, OpenAI, Google

@@ -3,6 +3,18 @@
 import json
 import re
 
+# Result prefixes shared with the structured trace (guide_trace.py).
+FAILED_LOOKUP_PREFIXES = ('Error executing tool:', 'Unknown tool:',
+                          'Invalid tool arguments:')
+NO_MATCH_PREFIXES = ('No ', 'Please specify', 'Unknown ',
+                     'I found multiple items matching')
+NO_MATCH_ITEM = re.compile(r"Item '.+' not found\.$")
+
+
+def readiness_key(name, arguments):
+    """Identity of one lookup in AnswerReadiness.checks."""
+    return (name, json.dumps(arguments, sort_keys=True))
+
 
 class AnswerReadiness:
     def __init__(self):
@@ -11,16 +23,14 @@ class AnswerReadiness:
     def record(self, name, arguments, result, executor):
         # Keep separate searches separate; a successful retry replaces only
         # the same call's previous failure. Never persist across requests.
-        key = (name, json.dumps(arguments, sort_keys=True))
+        key = readiness_key(name, arguments)
         notes = []
         usable = True
-        if result.startswith(('Error executing tool:', 'Unknown tool:',
-                              'Invalid tool arguments:')):
+        if result.startswith(FAILED_LOOKUP_PREFIXES):
             usable = False
             notes.append('A requested lookup failed; its facts remain unverified.')
-        elif not result.strip() or result.startswith(('No ', 'Please specify',
-                'Unknown ', 'I found multiple items matching')) or re.match(
-                r"Item '.+' not found\.$", result):
+        elif not result.strip() or result.startswith(NO_MATCH_PREFIXES) or \
+                NO_MATCH_ITEM.match(result):
             usable = False
             notes.append('A lookup returned no resolved match or needs more '
                          'detail. This does not prove the requested thing '

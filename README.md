@@ -403,6 +403,44 @@ That will open the full saved question and full saved answer for entry
 - `.ag clear` only clears guide conversation memory/history
 - It does not cancel pending questions or change cooldowns
 
+### Trusted Console Control and Structured Trace
+
+A local controller (for example a server dashboard) can ask the Guide on
+behalf of an **online** character through the exact same path as `.ag`:
+same validation, cooldown, pending limit, live character context, bridge,
+tools, grounding and memory. It uses two worldserver **console-only**
+commands (`SEC_CONSOLE`; they are rejected from any game session):
+
+```
+agctl submit <request-token> <character-guid> <base64url-question>
+agctl clear  <request-token> <character-guid>
+```
+
+- `request-token` is exactly 32 lowercase hex characters and becomes the
+  row's unique `external_request_id`.
+- The question is unpadded base64url UTF-8, at most 500 bytes and 8 lines,
+  with no control characters: the same limit as `.ag`.
+- Each command prints exactly one line and never echoes question or answer:
+  `AZC_GUIDE_CONTROL request=<token> action=submit status=<queued|invalid|offline|rejected|disabled> guid=<guid> reason=<token>`
+- Console questions are silent in game. Their rows are stored with
+  `origin = 'web'`; the world script only delivers and deletes
+  `origin = 'ingame'` rows, so the controller reads the finished row by its
+  token and deletes it itself.
+
+Every processed request stores a structured trace next to its response
+(`trace_json`, `grounding_state`, `provider_ms`, `tool_ms`, `total_ms`). The
+trace lists each routing and answer round with tool name, status
+(`succeeded`, `no-result`, `failed`, `invalid-arguments`, `unknown-tool`),
+duration, evidence-marker count and schema-declared scalar arguments only.
+It never contains tool result text, SQL, database rows, provider payloads,
+the system prompt, conversation text or model reasoning. Failures record a
+fixed error code instead of the exception message.
+
+The schema change ships as `data/sql/characters/updates/llm_guide_queue_web_ingress.sql`
+and is mirrored by the bridge migration; both are idempotent. The base SQL
+file is deliberately unchanged because AzerothCore re-applies a module SQL
+file whose hash changes and that file recreates the memory table.
+
 ## Configuration
 
 When upgrading, start the updated bridge before using the updated C++ module.
