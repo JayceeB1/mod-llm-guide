@@ -1,5 +1,14 @@
 # Changelog
 
+### 2026-09-19 - Lease Recovery Without Deadlocks (Azeroth Control fork)
+
+* **Bridge poll loop**: `fetch_pending_requests()` now finds expired leases
+  with a plain read and requeues them by primary key. The previous locking
+  `UPDATE ... WHERE status = 'processing'` also locked the row a worker was
+  completing, in the opposite index order, and deadlocked with
+  `save_response()` (MySQL 1213), losing that answer. A disposable-schema
+  stress run (2 workers + poll loop, 20 s) went from 281 save deadlocks to 0.
+
 ### 2026-09-19 - Trusted Console Ingress and Structured Trace (Azeroth Control fork)
 
 Fork of `Hokken/mod-llm-guide` at `4b89056`, kept minimal and upstreamable.

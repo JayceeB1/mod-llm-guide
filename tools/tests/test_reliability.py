@@ -233,11 +233,26 @@ class QueueTests(unittest.TestCase):
             self.bridge.remaining_timeout()
 
     def test_abandoned_leases_have_bounded_recovery(self):
+        self.cursor.fetchall.side_effect = [[(7,), (9,)], []]
         self.bridge.fetch_pending_requests(self.cursor)
-        query, args = self.cursor.execute.call_args_list[0].args
+        find = self.cursor.execute.call_args_list[0].args
+        self.assertEqual(len(find), 1)
+        self.assertTrue(find[0].strip().startswith('SELECT id'))
+        self.assertIn('lease_until < NOW()', find[0])
+        query, args = self.cursor.execute.call_args_list[1].args
         self.assertIn("IF(attempts < %s, 'pending', 'error')", query)
+        self.assertIn('WHERE id IN (%s, %s)', query)
+        self.assertIn("status = 'processing'", query)
         self.assertIn('lease_until < NOW()', query)
-        self.assertEqual(args, (self.bridge.max_attempts,))
+        self.assertEqual(args, (self.bridge.max_attempts, 7, 9))
+
+    def test_lease_recovery_never_locks_in_flight_rows(self):
+        # Nothing expired: no UPDATE runs, so a worker saving its answer
+        # cannot deadlock with the poll loop.
+        self.cursor.fetchall.side_effect = [[], []]
+        self.bridge.fetch_pending_requests(self.cursor)
+        statements = [call.args[0] for call in self.cursor.execute.call_args_list]
+        self.assertFalse(any('UPDATE' in statement for statement in statements))
 
     def test_transient_retry_and_permanent_error(self):
         self.bridge.deadline = time.monotonic() + 60

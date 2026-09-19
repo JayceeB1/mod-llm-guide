@@ -657,14 +657,27 @@ class LLMBridge:
 
     def fetch_pending_requests(self, cursor):
         """Fetch pending requests from the queue."""
+        # Find abandoned claims with a plain (non-locking) read, then requeue
+        # them by primary key. A locking scan of every 'processing' row also
+        # locks the row a worker is completing, in the opposite index order,
+        # and deadlocks with save_response (MySQL 1213).
         cursor.execute("""
-            UPDATE llm_guide_queue
-            SET status = IF(attempts < %s, 'pending', 'error'),
-                error_message = 'The guide request expired. Please try again.',
-                lease_token = NULL, lease_until = NULL
+            SELECT id FROM llm_guide_queue
             WHERE status = 'processing'
               AND (lease_until IS NULL OR lease_until < NOW())
-        """, (self.max_attempts,))
+        """)
+        expired = [row[0] for row in cursor.fetchall()]
+        if expired:
+            placeholders = ', '.join(['%s'] * len(expired))
+            cursor.execute(f"""
+                UPDATE llm_guide_queue
+                SET status = IF(attempts < %s, 'pending', 'error'),
+                    error_message = 'The guide request expired. Please try again.',
+                    lease_token = NULL, lease_until = NULL
+                WHERE id IN ({placeholders})
+                  AND status = 'processing'
+                  AND (lease_until IS NULL OR lease_until < NOW())
+            """, (self.max_attempts, *expired))
         cursor.execute("""
             SELECT q.id, q.character_guid, q.character_name,
                    q.character_context, q.question, q.position_x,
