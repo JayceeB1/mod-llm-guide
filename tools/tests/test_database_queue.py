@@ -76,6 +76,22 @@ class QueueDatabaseTests(unittest.TestCase):
         ''', (request_id,))
         self.assertGreater(self.cursor.fetchone()[0], 500)
 
+    def test_web_ingress_migration_is_idempotent_and_unique(self):
+        self.bridge._ensure_table_exists()
+        self.cursor.execute("SHOW COLUMNS FROM llm_guide_queue LIKE 'origin'")
+        self.assertIsNotNone(self.cursor.fetchone())
+        request_id = self.insert_request()
+        self.cursor.execute(
+            'SELECT origin, external_request_id FROM llm_guide_queue '
+            'WHERE id = %s', (request_id,))
+        self.assertEqual(self.cursor.fetchone(), ('ingame', None))
+        insert = ('INSERT INTO llm_guide_queue (character_guid, '
+                  'character_name, question, external_request_id, origin) '
+                  "VALUES (1, 'Test', 'q', %s, 'web')")
+        self.cursor.execute(insert, ('a' * 32,))
+        with self.assertRaises(Exception):
+            self.cursor.execute(insert, ('a' * 32,))
+
     def test_only_one_worker_claims_and_cancellation_wins(self):
         request_id = self.insert_request()
         other = LLMBridge(self.config)

@@ -49,6 +49,25 @@ from llm_compat import (
 )
 
 
+# Queue columns and keys for request origin, external request identity and
+# the structured trace. Kept identical to the SQL update file so a runtime
+# migrates the same way whether the bridge or the database updater runs first.
+WEB_INGRESS_COLUMNS = {
+    "external_request_id": "VARCHAR(64) NULL DEFAULT NULL",
+    "origin": "ENUM('ingame', 'web') NOT NULL DEFAULT 'ingame'",
+    "trace_json": "MEDIUMTEXT NULL DEFAULT NULL",
+    "grounding_state": "VARCHAR(32) NULL DEFAULT NULL",
+    "provider_ms": "INT UNSIGNED NULL DEFAULT NULL",
+    "tool_ms": "INT UNSIGNED NULL DEFAULT NULL",
+    "total_ms": "INT UNSIGNED NULL DEFAULT NULL",
+}
+WEB_INGRESS_KEYS = {
+    "uq_llm_guide_external_request":
+        "UNIQUE KEY `uq_llm_guide_external_request` (`external_request_id`)",
+    "idx_llm_guide_origin_status":
+        "KEY `idx_llm_guide_origin_status` (`origin`, `status`)",
+}
+
 GOOGLE_OPENAI_BASE_URL = (
     "https://generativelanguage.googleapis.com/v1beta/openai/"
 )
@@ -498,6 +517,17 @@ class LLMBridge:
                 alter_sql += f" AFTER `{after_column}`"
             cursor.execute(alter_sql)
 
+        def add_key_if_missing(cursor, table_name: str, key_name: str,
+                               key_definition: str):
+            cursor.execute(
+                f"SHOW INDEX FROM `{table_name}` WHERE Key_name = %s",
+                (key_name,),
+            )
+            if cursor.fetchall():
+                return
+            cursor.execute(
+                f"ALTER TABLE `{table_name}` ADD {key_definition}")
+
         create_queue_sql = """
         CREATE TABLE IF NOT EXISTS `llm_guide_queue` (
             `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -596,6 +626,14 @@ class LLMBridge:
                 "lease_until": "TIMESTAMP NULL DEFAULT NULL",
             }.items():
                 add_column_if_missing(
+                    cursor, "llm_guide_queue", name, definition)
+            # Mirrors data/sql/characters/updates/
+            # llm_guide_queue_web_ingress.sql; either may run first.
+            for name, definition in WEB_INGRESS_COLUMNS.items():
+                add_column_if_missing(
+                    cursor, "llm_guide_queue", name, definition)
+            for name, definition in WEB_INGRESS_KEYS.items():
+                add_key_if_missing(
                     cursor, "llm_guide_queue", name, definition)
             cursor.execute("""
                 SELECT DATA_TYPE FROM information_schema.COLUMNS

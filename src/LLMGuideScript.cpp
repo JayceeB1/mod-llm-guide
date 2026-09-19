@@ -68,6 +68,31 @@ static std::unordered_map<uint32, std::unordered_map<std::string, uint32>> playe
 static constexpr uint32 DEFAULT_HISTORY_COUNT = 5;
 static constexpr uint32 MAX_HISTORY_COUNT = 10;
 
+// One question limit for every ingress (.ag, whisper, trusted console).
+static constexpr size_t MAX_GUIDE_QUESTION_BYTES = 500;
+static constexpr uint32 MAX_GUIDE_QUESTION_LINES = 8;
+
+// Machine-readable prefix for the trusted console control protocol.
+static constexpr char const* GUIDE_CONTROL_PREFIX = "AZC_GUIDE_CONTROL";
+static constexpr size_t GUIDE_REQUEST_TOKEN_LENGTH = 32;
+
+// Where a queued question came from. In-game rows are delivered to the
+// player by LLMGuide_WorldScript; other origins are read back and removed by
+// the external controller that submitted them.
+enum class GuideRequestOrigin
+{
+    InGame,
+    Web
+};
+
+struct GuideSubmitOptions
+{
+    GuideRequestOrigin origin = GuideRequestOrigin::InGame;
+    std::string externalRequestId;
+    bool emitPlayerFeedback = true;
+    bool isWhisper = false;
+};
+
 // Forward declaration
 static bool SubmitQuestion(Player* player, const std::string& question, bool isWhisper = false);
 
@@ -1142,30 +1167,118 @@ static std::string BuildCharacterContext(Player* player)
     return ctx.str();
 }
 
-// Submit a question to the LLM queue
-// Returns true if question was submitted, false if rejected (cooldown, limit, etc.)
-static bool SubmitQuestion(Player* player, const std::string& questionStr, bool isWhisper)
+// Strict UTF-8 check (no overlongs, surrogates or code points past U+10FFFF).
+static bool IsValidUtf8(std::string const& text)
 {
-    if (!sLLMGuideConfig->IsEnabled())
+    size_t i = 0;
+    while (i < text.size())
     {
-        ChatHandler(player->GetSession()).PSendSysMessage("LLM Chat is currently disabled.");
-        return false;
-    }
-
-    if (questionStr.empty())
-    {
-        if (isWhisper)
-            ChatHandler(player->GetSession()).PSendSysMessage("Just whisper your question to AzerothGuide!");
+        unsigned char const lead = static_cast<unsigned char>(text[i]);
+        size_t extra = 0;
+        uint32 codePoint = 0;
+        if (lead < 0x80)
+        {
+            ++i;
+            continue;
+        }
+        else if ((lead & 0xE0) == 0xC0)
+        {
+            extra = 1;
+            codePoint = lead & 0x1F;
+        }
+        else if ((lead & 0xF0) == 0xE0)
+        {
+            extra = 2;
+            codePoint = lead & 0x0F;
+        }
+        else if ((lead & 0xF8) == 0xF0)
+        {
+            extra = 3;
+            codePoint = lead & 0x07;
+        }
         else
-            ChatHandler(player->GetSession()).PSendSysMessage("Usage: .ag <your question>");
-        return false;
+            return false;
+
+        if (i + extra >= text.size())
+            return false;
+        for (size_t k = 1; k <= extra; ++k)
+        {
+            unsigned char const next = static_cast<unsigned char>(text[i + k]);
+            if ((next & 0xC0) != 0x80)
+                return false;
+            codePoint = (codePoint << 6) | (next & 0x3F);
+        }
+        static constexpr uint32 minimum[] = { 0, 0x80, 0x800, 0x10000 };
+        if (codePoint < minimum[extra] || codePoint > 0x10FFFF ||
+            (codePoint >= 0xD800 && codePoint <= 0xDFFF))
+            return false;
+        i += extra + 1;
+    }
+    return true;
+}
+
+// Shared question validator for every ingress. Returns nullptr when valid,
+// otherwise a stable reason token. The client cannot send control
+// characters in chat, so the extra checks only ever matter for the console.
+static char const* ValidateGuideQuestion(std::string const& question)
+{
+    bool hasText = std::any_of(question.begin(), question.end(),
+        [](unsigned char ch) { return !std::isspace(ch); });
+    if (!hasText)
+        return "empty";
+    if (question.size() > MAX_GUIDE_QUESTION_BYTES)
+        return "too-long";
+
+    uint32 lines = 1;
+    for (unsigned char ch : question)
+    {
+        if (ch == '\n')
+        {
+            if (++lines > MAX_GUIDE_QUESTION_LINES)
+                return "too-many-lines";
+            continue;
+        }
+        if (ch < 0x20 || ch == 0x7F)
+            return "invalid-characters";
     }
 
-    // Limit question length
-    if (questionStr.length() > 500)
+    if (!IsValidUtf8(question))
+        return "invalid-utf8";
+    return nullptr;
+}
+
+// Queue one question for the shared bridge engine. Every ingress calls this:
+// it owns validation, cooldown, pending limits, the live character context
+// and snapshot, and the queue row. `reasonOut` receives "-" on success or the
+// reason token of the rejection.
+static bool SubmitGuideRequest(
+    Player* player,
+    std::string const& questionStr,
+    GuideSubmitOptions const& options,
+    std::string* reasonOut = nullptr)
+{
+    auto reject = [&](char const* reason, std::string const& feedback)
     {
-        ChatHandler(player->GetSession()).PSendSysMessage("Question too long. Please keep it under 500 characters.");
+        if (reasonOut)
+            *reasonOut = reason;
+        if (options.emitPlayerFeedback && !feedback.empty())
+            ChatHandler(player->GetSession()).SendSysMessage(feedback);
         return false;
+    };
+
+    if (!sLLMGuideConfig->IsEnabled())
+        return reject("module-disabled", "LLM Chat is currently disabled.");
+
+    if (char const* invalid = ValidateGuideQuestion(questionStr))
+    {
+        std::string const reason = invalid;
+        if (reason == "empty")
+            return reject(invalid, options.isWhisper
+                ? "Just whisper your question to AzerothGuide!"
+                : "Usage: .ag <your question>");
+        if (reason == "too-long")
+            return reject(invalid, "Question too long. Please keep it under 500 characters.");
+        return reject(invalid, "Question contains unsupported characters or too many lines.");
     }
 
     uint32 guid = player->GetGUID().GetCounter();
@@ -1179,8 +1292,8 @@ static bool SubmitQuestion(Player* player, const std::string& questionStr, bool 
         if (elapsed < sLLMGuideConfig->GetCooldownSeconds())
         {
             uint32 remaining = sLLMGuideConfig->GetCooldownSeconds() - elapsed;
-            ChatHandler(player->GetSession()).PSendSysMessage("Please wait {} seconds before asking another question.", remaining);
-            return false;
+            return reject("cooldown", Acore::StringFormat(
+                "Please wait {} seconds before asking another question.", remaining));
         }
     }
 
@@ -1193,11 +1306,23 @@ static bool SubmitQuestion(Player* player, const std::string& questionStr, bool 
     {
         uint32 pendingCount = (*pendingResult)[0].Get<uint32>();
         if (pendingCount >= sLLMGuideConfig->GetMaxPendingPerPlayer())
-        {
-            ChatHandler(player->GetSession()).PSendSysMessage("You have too many pending questions. Please wait for responses.");
-            return false;
-        }
+            return reject("too-many-pending",
+                "You have too many pending questions. Please wait for responses.");
     }
+
+    std::string externalRequestId = "NULL";
+    if (!options.externalRequestId.empty())
+    {
+        std::string escapedRequestId = options.externalRequestId;
+        CharacterDatabase.EscapeString(escapedRequestId);
+        if (CharacterDatabase.Query(
+                "SELECT 1 FROM llm_guide_queue WHERE external_request_id = '{}' LIMIT 1",
+                escapedRequestId))
+            return reject("duplicate-request", "");
+        externalRequestId = "'" + escapedRequestId + "'";
+    }
+    char const* origin =
+        options.origin == GuideRequestOrigin::Web ? "web" : "ingame";
 
     // Build character context
     std::string characterContext = BuildCharacterContext(player);
@@ -1240,8 +1365,8 @@ static bool SubmitQuestion(Player* player, const std::string& questionStr, bool 
 
     // Insert into queue
     CharacterDatabase.Execute(
-        "INSERT INTO llm_guide_queue (character_guid, character_name, character_context, question, position_x, position_y, map_id, active_quest_ids, character_snapshot, status, created_at) "
-        "VALUES ({}, '{}', '{}', '{}', {}, {}, {}, '{}', '{}', 'pending', NOW())",
+        "INSERT INTO llm_guide_queue (character_guid, character_name, character_context, question, position_x, position_y, map_id, active_quest_ids, character_snapshot, external_request_id, origin, status, created_at) "
+        "VALUES ({}, '{}', '{}', '{}', {}, {}, {}, '{}', '{}', {}, '{}', 'pending', NOW())",
         guid,
         escapedName,
         escapedContext,
@@ -1250,20 +1375,38 @@ static bool SubmitQuestion(Player* player, const std::string& questionStr, bool 
         posY,
         mapId,
         activeQuestIdList,
-        snapshot);
+        snapshot,
+        externalRequestId,
+        origin);
 
     // Update cooldown
     playerCooldowns[guid] = now;
 
     // Send confirmation
-    ChatHandler handler(player->GetSession());
-    std::string youMsg = "|cFFFFFF00[You]: " + questionStr + "|r";
-    handler.SendSysMessage(youMsg.c_str());
-    handler.SendSysMessage("|cFF66AAFFProcessing your question...|r");
+    if (options.emitPlayerFeedback)
+    {
+        ChatHandler handler(player->GetSession());
+        std::string youMsg = "|cFFFFFF00[You]: " + questionStr + "|r";
+        handler.SendSysMessage(youMsg.c_str());
+        handler.SendSysMessage("|cFF66AAFFProcessing your question...|r");
+    }
 
-    LOG_DEBUG("module", "LLM Chat: Player {} asked (via {}): {}", player->GetName(), isWhisper ? "whisper" : "command", questionStr);
+    LOG_DEBUG("module", "LLM Chat: Player {} asked (via {}): {}", player->GetName(),
+        options.origin == GuideRequestOrigin::Web ? "web"
+            : options.isWhisper ? "whisper" : "command",
+        questionStr);
 
+    if (reasonOut)
+        *reasonOut = "-";
     return true;
+}
+
+// Existing in-game entry points (.ag and whisper) keep their exact behaviour.
+static bool SubmitQuestion(Player* player, const std::string& questionStr, bool isWhisper)
+{
+    GuideSubmitOptions options;
+    options.isWhisper = isWhisper;
+    return SubmitGuideRequest(player, questionStr, options);
 }
 
 static void PopulateHistoryEntryFromSummary(
@@ -1463,12 +1606,11 @@ static bool ShowHistoryEntry(
     return true;
 }
 
-static bool ClearHistory(ChatHandler* handler, Player* player)
+// Delete one character's session memory; shared by `.ag clear` and the
+// trusted console. Returns the best-effort pre-delete count (a concurrent
+// bridge write could make it slightly stale).
+static uint32 ClearGuideMemory(uint32 guid)
 {
-    uint32 guid = player->GetGUID().GetCounter();
-
-    // Best-effort pre-delete count for user feedback. A concurrent bridge
-    // write could make the reported count slightly stale.
     QueryResult countResult = CharacterDatabase.Query(
         "SELECT COUNT(*) FROM llm_guide_memory WHERE character_guid = {}",
         guid);
@@ -1477,9 +1619,15 @@ static bool ClearHistory(ChatHandler* handler, Player* player)
     if (countResult)
         deletedCount = (*countResult)[0].Get<uint32>();
 
-    CharacterDatabase.Execute(
+    CharacterDatabase.DirectExecute(
         "DELETE FROM llm_guide_memory WHERE character_guid = {}",
         guid);
+    return deletedCount;
+}
+
+static bool ClearHistory(ChatHandler* handler, Player* player)
+{
+    uint32 deletedCount = ClearGuideMemory(player->GetGUID().GetCounter());
 
     handler->PSendSysMessage(
         "{}: Cleared {} conversation {}.",
@@ -1829,6 +1977,93 @@ static bool TryHandleAgAliasCommand(
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Trusted console control protocol (`agctl`). It lets a local controller
+// submit a question for an online character through the exact same
+// SubmitGuideRequest path as .ag, and clear that character's session memory.
+// Only fixed, validated tokens reach it; it never echoes question or answer
+// text and emits exactly one parseable line per command.
+// ---------------------------------------------------------------------------
+
+// Longest unpadded base64url encoding of a MAX_GUIDE_QUESTION_BYTES payload.
+static constexpr size_t MAX_GUIDE_CONTROL_PAYLOAD =
+    (MAX_GUIDE_QUESTION_BYTES * 4 + 2) / 3;
+
+static bool IsGuideRequestToken(std::string const& token)
+{
+    return token.size() == GUIDE_REQUEST_TOKEN_LENGTH &&
+        std::all_of(token.begin(), token.end(), [](unsigned char ch)
+        {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        });
+}
+
+// Strict unpadded RFC 4648 section 5 decoding. Any other byte, padding, an
+// impossible length or non-zero trailing bits invalidates the payload.
+static bool DecodeBase64Url(std::string const& input, std::string& output)
+{
+    if (input.empty() || input.size() % 4 == 1)
+        return false;
+
+    output.clear();
+    output.reserve(input.size() * 3 / 4);
+    uint32 buffer = 0;
+    int bits = 0;
+    for (char ch : input)
+    {
+        uint32 value;
+        if (ch >= 'A' && ch <= 'Z')
+            value = uint32(ch - 'A');
+        else if (ch >= 'a' && ch <= 'z')
+            value = uint32(ch - 'a') + 26;
+        else if (ch >= '0' && ch <= '9')
+            value = uint32(ch - '0') + 52;
+        else if (ch == '-')
+            value = 62;
+        else if (ch == '_')
+            value = 63;
+        else
+            return false;
+
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            output.push_back(char((buffer >> bits) & 0xFF));
+        }
+    }
+    return (buffer & ((1u << bits) - 1)) == 0;
+}
+
+static std::vector<std::string> SplitControlArguments(std::string const& text)
+{
+    std::vector<std::string> tokens;
+    std::istringstream stream(text);
+    std::string token;
+    while (stream >> token)
+        tokens.push_back(token);
+    return tokens;
+}
+
+static void EmitGuideControl(
+    ChatHandler* handler,
+    std::string const& request,
+    char const* action,
+    char const* status,
+    uint32 guid,
+    std::string const& reason)
+{
+    handler->SendSysMessage(Acore::StringFormat(
+        "{} request={} action={} status={} guid={} reason={}",
+        GUIDE_CONTROL_PREFIX,
+        IsGuideRequestToken(request) ? request : std::string("-"),
+        action,
+        status,
+        guid,
+        reason.empty() ? std::string("-") : reason));
+}
+
 class LLMGuide_CommandScript : public CommandScript
 {
 public:
@@ -1836,12 +2071,105 @@ public:
 
     ChatCommandTable GetCommands() const override
     {
+        // SEC_CONSOLE is above every account level, so only the worldserver
+        // console can reach these; the handlers re-check IsConsole().
+        static ChatCommandTable controlTable =
+        {
+            { "submit", HandleControlSubmit, SEC_CONSOLE, Console::Yes },
+            { "clear", HandleControlClear, SEC_CONSOLE, Console::Yes },
+        };
+
         static ChatCommandTable commandTable =
         {
             { "ag", HandleAskCommand, SEC_PLAYER, Console::No },  // Shortcut: .ag
+            { "agctl", controlTable },
         };
 
         return commandTable;
+    }
+
+    // agctl submit <request-token> <character-guid> <base64url-question>
+    static bool HandleControlSubmit(ChatHandler* handler, Tail args)
+    {
+        std::vector<std::string> const tokens =
+            SplitControlArguments(std::string(args));
+        std::string const request = tokens.empty() ? std::string() : tokens[0];
+
+        if (!handler->IsConsole())
+        {
+            EmitGuideControl(handler, request, "submit", "rejected", 0, "console-only");
+            return true;
+        }
+
+        uint32 guid = 0;
+        if (tokens.size() != 3 || !IsGuideRequestToken(request) ||
+            !TryParsePositiveUInt32(tokens[1], guid))
+        {
+            EmitGuideControl(handler, request, "submit", "invalid", guid, "bad-arguments");
+            return true;
+        }
+
+        std::string question;
+        if (tokens[2].size() > MAX_GUIDE_CONTROL_PAYLOAD ||
+            !DecodeBase64Url(tokens[2], question))
+        {
+            EmitGuideControl(handler, request, "submit", "invalid", guid, "bad-encoding");
+            return true;
+        }
+
+        if (char const* invalid = ValidateGuideQuestion(question))
+        {
+            EmitGuideControl(handler, request, "submit", "invalid", guid, invalid);
+            return true;
+        }
+
+        Player* player = ObjectAccessor::FindPlayerByLowGUID(guid);
+        if (!player || !player->IsInWorld() ||
+            player->GetGUID().GetCounter() != guid)
+        {
+            EmitGuideControl(handler, request, "submit", "offline", guid, "player-offline");
+            return true;
+        }
+
+        GuideSubmitOptions options;
+        options.origin = GuideRequestOrigin::Web;
+        options.externalRequestId = request;
+        options.emitPlayerFeedback = false;
+
+        std::string reason;
+        if (SubmitGuideRequest(player, question, options, &reason))
+            EmitGuideControl(handler, request, "submit", "queued", guid, "-");
+        else
+            EmitGuideControl(handler, request, "submit",
+                reason == "module-disabled" ? "disabled" : "rejected",
+                guid, reason);
+        return true;
+    }
+
+    // agctl clear <request-token> <character-guid>
+    static bool HandleControlClear(ChatHandler* handler, Tail args)
+    {
+        std::vector<std::string> const tokens =
+            SplitControlArguments(std::string(args));
+        std::string const request = tokens.empty() ? std::string() : tokens[0];
+
+        if (!handler->IsConsole())
+        {
+            EmitGuideControl(handler, request, "clear", "rejected", 0, "console-only");
+            return true;
+        }
+
+        uint32 guid = 0;
+        if (tokens.size() != 2 || !IsGuideRequestToken(request) ||
+            !TryParsePositiveUInt32(tokens[1], guid))
+        {
+            EmitGuideControl(handler, request, "clear", "invalid", guid, "bad-arguments");
+            return true;
+        }
+
+        ClearGuideMemory(guid);
+        EmitGuideControl(handler, request, "clear", "cleared", guid, "-");
+        return true;
     }
 
     static bool HandleAskCommand(ChatHandler* handler, Tail question)
@@ -1929,18 +2257,20 @@ public:
             "AND created_at < TIMESTAMPADD(SECOND, -{}, NOW())",
             sLLMGuideConfig->GetQueueTimeoutSeconds());
 
-        // Atomically mark rows as 'delivered' to prevent duplicate processing
+        // Atomically mark rows as 'delivered' to prevent duplicate processing.
+        // Only in-game rows are delivered here; other origins stay terminal
+        // until the controller that submitted them reads and removes them.
         CharacterDatabase.DirectExecute(
             "UPDATE llm_guide_queue SET "
             "response = IF(status = 'error', "
             "'The guide could not finish that request. Please try again.', "
             "response), status = 'delivered' "
-            "WHERE status IN ('complete', 'error') LIMIT 5");
+            "WHERE status IN ('complete', 'error') AND origin = 'ingame' LIMIT 5");
 
         // Now fetch the rows we just marked
         QueryResult result = CharacterDatabase.Query(
             "SELECT id, character_guid, character_name, response FROM llm_guide_queue "
-            "WHERE status = 'delivered'");
+            "WHERE status = 'delivered' AND origin = 'ingame'");
 
         if (!result)
             return;
