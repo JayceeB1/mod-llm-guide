@@ -15,7 +15,7 @@ from guide_tool_items import GuideToolItemMixin
 from guide_reliability import EvidenceLedger, validate_arguments
 from guide_item_comparison import DEFAULT_ROLE_STATS
 from guide_services import SERVICE_PATTERNS
-from guide_readiness import AnswerReadiness
+from guide_readiness import AnswerReadiness, leaks_tool_call
 from guide_presentation import compact_equipment_answer
 
 logger = logging.getLogger(__name__)
@@ -749,6 +749,9 @@ class GameToolExecutor(
 
     def finalize_answer(self, response, required, detailed=False):
         """Validate model output before adding verified links/source notes."""
+        if leaks_tool_call(response):
+            # Independent of readiness_enabled: tool-call markup never reaches chat.
+            return self.readiness.abandon()
         if self.readiness_enabled:
             response = self.readiness.finalize(response)
             # A deterministic limitation is valid even when every lookup

@@ -1647,7 +1647,8 @@ class LLMBridge:
     def grounding_state(self, question, clarified):
         """Final grounding of a published answer, from the same authorities
         finalize_answer used (requires_evidence and AnswerReadiness)."""
-        if clarified:
+        if clarified or self.tool_executor.readiness.unfinished:
+            # A tool call written as the answer was replaced by a request to narrow it.
             return 'clarification'
         if not requires_evidence(question):
             return 'not-required'

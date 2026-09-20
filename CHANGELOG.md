@@ -1,5 +1,23 @@
 # Changelog
 
+### 2026-09-20 - A Tool Call Is Never an Answer (Azeroth Control fork)
+
+* **Leaked tool calls are not published**: on the `ollama` lane the last round
+  carries no tool catalog. When the model still wanted another lookup it wrote
+  the call as text (`<tool_call><function=get_item_info>...`). Readiness saw one
+  unrelated lookup that had succeeded (`get_character_context`, or the first
+  quest lookup), called the answer verified, appended "Some requested details
+  remain unverified." and delivered the raw markup to the player.
+  `GameToolExecutor.finalize_answer()` now replaces any text that carries
+  tool-call markup with a deterministic "I could not finish that lookup. Could
+  you name one specific item, quest, NPC or place?", whatever else succeeded and
+  whether or not readiness is enabled. The trace records the answer as a
+  `clarification`, never `verified`, and no markup is stored as session memory.
+  An answer without markup is unchanged.
+* **Tests**: `tests/test_leaked_tool_call.py` (the two published leaks, partial
+  and upper-case markup, an unrelated successful lookup, readiness disabled, the
+  trace state, and clean answers and readiness limitations as controls).
+
 ### 2026-09-20 - Every Empty Lookup Is a No-Result (Azeroth Control fork)
 
 * **Readiness and trace**: only `No ...` / `Unknown ...` results and

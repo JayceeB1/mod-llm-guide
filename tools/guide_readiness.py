@@ -15,6 +15,20 @@ NO_MATCH_ENTITY = re.compile(
     r" '.*' not found\b")
 NO_MATCH_ITEM = NO_MATCH_ENTITY  # former item-only name, kept for importers
 
+# What a model writes when it wants another lookup that its round no longer
+# offers: XML tool-call markup as the answer text. The ollama lane's last round
+# carries no tool catalog, so a model that has already seen tool calls in the
+# conversation writes the next one as text instead.
+TOOL_CALL_MARKUP = ('<tool_call>', '</tool_call>', '<function=', '</function>')
+UNFINISHED_ANSWER = ('I could not finish that lookup. Could you name one '
+                     'specific item, quest, NPC or place?')
+
+
+def leaks_tool_call(text):
+    """True when the text carries tool-call markup instead of (or inside) an answer."""
+    lowered = (text or '').casefold()
+    return any(marker in lowered for marker in TOOL_CALL_MARKUP)
+
 
 def readiness_key(name, arguments):
     """Identity of one lookup in AnswerReadiness.checks."""
@@ -24,6 +38,18 @@ def readiness_key(name, arguments):
 class AnswerReadiness:
     def __init__(self):
         self.checks = {}
+        # Set when the model's last text was a tool call, not an answer.
+        self.unfinished = False
+
+    def abandon(self):
+        """Replace a leaked tool call with a deterministic request to narrow it.
+
+        Unlike blocked(), this holds whatever other lookup succeeded: markup
+        answers nothing, and a lookup that has nothing to do with the question
+        (for example the character context) cannot make it a verified answer.
+        """
+        self.unfinished = True
+        return UNFINISHED_ANSWER
 
     def record(self, name, arguments, result, executor):
         # Keep separate searches separate; a successful retry replaces only
