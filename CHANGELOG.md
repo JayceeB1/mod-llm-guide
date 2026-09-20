@@ -1,5 +1,20 @@
 # Changelog
 
+### 2026-09-20 - Every Empty Lookup Is a No-Result (Azeroth Control fork)
+
+* **Readiness and trace**: only `No ...` / `Unknown ...` results and
+  `Item '...' not found.` counted as empty. `get_quest_info` on an unknown quest
+  ID returns `Quest '' not found.`, and zones, dungeons, bosses, creatures,
+  battlegrounds, factions and recipes report `<Kind> '...' not found` too, so
+  every such lookup was traced as `succeeded` and its answer as `verified`,
+  even when the model honestly said the entity does not exist.
+  `NO_MATCH_ENTITY` now covers every kind (with an empty name allowed); an empty
+  lookup is a `no-result` and a blocked answer ends in the deterministic "I
+  could not find a clear match". A lookup that found something is unchanged, and
+  one empty lookup still does not erase a grounded one.
+* **Tests**: `tests/test_empty_lookup_grounding.py` lists every not-found shape
+  the tools return, with the already-recognised ones as controls.
+
 ### 2026-09-20 - Standalone Questions Ignore the Session (Azeroth Control fork)
 
 * **Conversation resolver only when needed**: `route_question()` used to call

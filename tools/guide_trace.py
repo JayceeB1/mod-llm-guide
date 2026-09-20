@@ -14,7 +14,7 @@ import re
 import time
 
 from guide_readiness import (
-    FAILED_LOOKUP_PREFIXES, NO_MATCH_ITEM, NO_MATCH_PREFIXES, readiness_key,
+    FAILED_LOOKUP_PREFIXES, NO_MATCH_ENTITY, NO_MATCH_PREFIXES, readiness_key,
 )
 from guide_reliability import EvidenceLedger
 
@@ -94,7 +94,7 @@ def classify_tool_result(name, arguments, result, executor=None):
         if check is not None:
             return 'succeeded'
     if not text.strip() or text.startswith(NO_MATCH_PREFIXES) or \
-            NO_MATCH_ITEM.match(text):
+            NO_MATCH_ENTITY.match(text):
         return 'no-result'
     return 'succeeded'
 

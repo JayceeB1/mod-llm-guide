@@ -8,7 +8,12 @@ FAILED_LOOKUP_PREFIXES = ('Error executing tool:', 'Unknown tool:',
                           'Invalid tool arguments:')
 NO_MATCH_PREFIXES = ('No ', 'Please specify', 'Unknown ',
                      'I found multiple items matching')
-NO_MATCH_ITEM = re.compile(r"Item '.+' not found\.$")
+# "<Kind> '<name>' not found..." for every entity kind the tools search. The
+# name may be empty: a lookup by ID (get_quest_info) reports "Quest '' not found."
+NO_MATCH_ENTITY = re.compile(
+    r"(?:Item|Quest|Zone|Dungeon|Boss|Creature|Battleground|Faction|Recipe for)"
+    r" '.*' not found\b")
+NO_MATCH_ITEM = NO_MATCH_ENTITY  # former item-only name, kept for importers
 
 
 def readiness_key(name, arguments):
@@ -30,7 +35,7 @@ class AnswerReadiness:
             usable = False
             notes.append('A requested lookup failed; its facts remain unverified.')
         elif not result.strip() or result.startswith(NO_MATCH_PREFIXES) or \
-                NO_MATCH_ITEM.match(result):
+                NO_MATCH_ENTITY.match(result):
             usable = False
             notes.append('A lookup returned no resolved match or needs more '
                          'detail. This does not prove the requested thing '
