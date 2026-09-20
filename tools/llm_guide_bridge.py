@@ -40,7 +40,7 @@ from guide_trace import GuideTraceCollector, classify_error, trace_json
 from guide_tool_contracts import export_tools
 from guide_conversation import (
     CONTEXT_TOOL, CONTEXT_PROMPT, conversation_view, parse_context,
-    encode_context, decode_context,
+    encode_context, decode_context, replayable_history,
 )
 from llm_compat import (
     build_chat_options,
@@ -1542,6 +1542,18 @@ class LLMBridge:
 
             # Fetch conversation memories for this character
             memories = self.fetch_memories(cursor, char_guid)
+
+            # A standalone question behaves exactly as it would in a new
+            # session: it is neither resolved against, nor answered with, the
+            # earlier turns. Memory stays enabled and is stored for every
+            # request; only a request that depends on it consults it.
+            available = memories.get('recent', [])
+            if available and not replayable_history(question, available):
+                logger.info(
+                    f"Standalone question: {len(available)} session memories "
+                    "kept, not consulted"
+                )
+                memories = {'recent': [], 'older_topics': []}
 
             # Build enriched system prompt with context and memory
             system_prompt = self.build_system_prompt(char_context, memories)

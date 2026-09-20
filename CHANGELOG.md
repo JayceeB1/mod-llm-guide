@@ -1,5 +1,27 @@
 # Changelog
 
+### 2026-09-20 - Standalone Questions Ignore the Session (Azeroth Control fork)
+
+* **Conversation resolver only when needed**: `route_question()` used to call
+  the conversation resolver (an LLM call) on every request of a character that
+  had any Session History. A `clarify` or `unsupported` answer ended the
+  request before a tool ran, even for a question that named everything it
+  needed, and the stored refusal then fed the next request. In a live
+  qualification only 5 of 14 independent questions reached the tools.
+  `guide_conversation.needs_conversation_context()` now decides, and
+  `process_request()` applies it: a question that is worded as a question,
+  names its target (proper noun, quoted name, numeric ID or a named service)
+  and carries no reference to an earlier turn is handled exactly as in a new
+  session, with no resolver call, no replayed turns and no "previously
+  discussed topics" in the prompt. Anything else keeps the resolver as before.
+* **Memory is unchanged**: it stays enabled and every request is still stored.
+  The trace reports the turns actually replayed (0 for a standalone question).
+* **Tests**: first tests of the fork, `python -m unittest discover -s tests`.
+  They cover a standalone question after five memories going straight to the
+  tools, a real follow-up using the conversation context, and a topic change
+  ignoring the old context, both at the routing level and through
+  `process_request()`.
+
 ### 2026-09-19 - Lease Recovery Without Deadlocks (Azeroth Control fork)
 
 * **Bridge poll loop**: `fetch_pending_requests()` now finds expired leases
